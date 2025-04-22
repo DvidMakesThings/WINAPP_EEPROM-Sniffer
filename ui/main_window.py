@@ -1,3 +1,4 @@
+import os
 from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, 
                               QWidget, QPushButton, QComboBox, QLabel, 
                               QTabWidget, QSplitter, QFileDialog, 
@@ -9,7 +10,7 @@ from ui.hex_view import HexView
 from ui.byte_editor import ByteEditor
 from ui.log_console import LogConsole
 from hardware.ch341_manager import CH341Manager
-from utils.eeprom_types import EEPROM_SIZES, I2C_SPEEDS
+from utils.eeprom_types import EEPROM_SIZES, I2C_SPEEDS, MANUFACTURERS
 
 class MainWindow(QMainWindow):
     """Main application window"""
@@ -86,11 +87,15 @@ class MainWindow(QMainWindow):
         connection_group = QGroupBox("Connection")
         conn_layout = QHBoxLayout(connection_group)
         
+        # Manufacturer dropdown
+        self.manufacturer_label = QLabel("Manufacturer:")
+        self.manufacturer_combo = QComboBox()
+        self.manufacturer_combo.addItems(MANUFACTURERS.keys())
+        self.manufacturer_combo.currentTextChanged.connect(self.update_eeprom_sizes)
+        
         # EEPROM size dropdown
-        self.eeprom_size_label = QLabel("EEPROM Size:")
+        self.eeprom_size_label = QLabel("EEPROM Type:")
         self.eeprom_size_combo = QComboBox()
-        for size in EEPROM_SIZES:
-            self.eeprom_size_combo.addItem(size["name"])
         
         # I2C speed dropdown
         self.i2c_speed_label = QLabel("I2C Speed:")
@@ -106,6 +111,8 @@ class MainWindow(QMainWindow):
         self.detect_button = QPushButton("Detect EEPROM")
         self.detect_button.setEnabled(False)
         
+        conn_layout.addWidget(self.manufacturer_label)
+        conn_layout.addWidget(self.manufacturer_combo)
         conn_layout.addWidget(self.eeprom_size_label)
         conn_layout.addWidget(self.eeprom_size_combo)
         conn_layout.addWidget(self.i2c_speed_label)
@@ -154,7 +161,29 @@ class MainWindow(QMainWindow):
         
         panel_layout.addWidget(operation_group)
         
+        # Initialize EEPROM sizes for default manufacturer
+        self.update_eeprom_sizes(self.manufacturer_combo.currentText())
+        
         return panel
+        
+    def update_eeprom_sizes(self, manufacturer):
+        """Update EEPROM size dropdown based on selected manufacturer"""
+        self.eeprom_size_combo.clear()
+        if manufacturer in MANUFACTURERS:
+            devices = MANUFACTURERS[manufacturer]["devices"]
+            prefix = MANUFACTURERS[manufacturer]["prefix"]
+            
+            for size in EEPROM_SIZES:
+                # Extract base model (e.g., "24C32" from "24C32 (32Kbit / 4K bytes)")
+                base_model = size["name"].split()[0]
+                # Check if this size matches any of the manufacturer's devices
+                if any(device in base_model for device in devices):
+                    # Add manufacturer prefix if needed
+                    if not base_model.startswith(prefix):
+                        display_name = f"{prefix}{base_model[4:]} {size['name'][6:]}"
+                    else:
+                        display_name = size["name"]
+                    self.eeprom_size_combo.addItem(display_name)
         
     def setup_connections(self):
         """Connect UI signals to slots"""
@@ -177,6 +206,10 @@ class MainWindow(QMainWindow):
         if geometry:
             self.restoreGeometry(geometry)
             
+        # Restore manufacturer
+        manufacturer = self.settings.value("manufacturer", 0, int)
+        self.manufacturer_combo.setCurrentIndex(manufacturer)
+        
         # Restore EEPROM size and I2C speed
         eeprom_size = self.settings.value("eeprom_size", 0, int)
         self.eeprom_size_combo.setCurrentIndex(eeprom_size)
@@ -187,6 +220,7 @@ class MainWindow(QMainWindow):
     def save_settings(self):
         """Save settings to QSettings"""
         self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("manufacturer", self.manufacturer_combo.currentIndex())
         self.settings.setValue("eeprom_size", self.eeprom_size_combo.currentIndex())
         self.settings.setValue("i2c_speed", self.i2c_speed_combo.currentIndex())
         
@@ -197,6 +231,13 @@ class MainWindow(QMainWindow):
         if self.ch341.is_connected():
             self.ch341.disconnect()
         event.accept()
+        
+    def get_eeprom_size_by_name(self, name):
+        """Get EEPROM size configuration by name"""
+        for size in EEPROM_SIZES:
+            if name in size["name"]:
+                return size
+        return None
         
     @pyqtSlot()
     def toggle_connection(self):
@@ -213,7 +254,7 @@ class MainWindow(QMainWindow):
             success = self.ch341.connect(eeprom_size, i2c_speed)
             
             if success:
-                self.logger.info(f"Connected to CH341 with {eeprom_size['name']} at {i2c_speed['name']}")
+                self.logger.info(f"Connected to CH341 with {i2c_speed['name']}")
                 self.connect_button.setText("Disconnect")
                 self.connect_button.setProperty("type", "disconnect")
                 self.connect_button.style().unpolish(self.connect_button)
@@ -240,8 +281,6 @@ class MainWindow(QMainWindow):
         self.erase_button.setEnabled(True)
         self.verify_button.setEnabled(True)
         self.dump_button.setEnabled(True)
-        self.eeprom_size_combo.setEnabled(False)
-        self.i2c_speed_combo.setEnabled(False)
         
     def update_ui_disconnected(self):
         """Update UI elements for disconnected state"""
@@ -251,8 +290,6 @@ class MainWindow(QMainWindow):
         self.erase_button.setEnabled(False)
         self.verify_button.setEnabled(False)
         self.dump_button.setEnabled(False)
-        self.eeprom_size_combo.setEnabled(True)
-        self.i2c_speed_combo.setEnabled(True)
         
     @pyqtSlot()
     def update_status(self):
@@ -269,9 +306,18 @@ class MainWindow(QMainWindow):
         eeprom_info = self.ch341.detect_eeprom()
         
         if eeprom_info:
+            # Find matching EEPROM size configuration
+            detected_size = self.get_eeprom_size_by_name(eeprom_info["type"])
+            if detected_size:
+                # Update UI with detected type
+                for i in range(self.eeprom_size_combo.count()):
+                    if detected_size["name"] in self.eeprom_size_combo.itemText(i):
+                        self.eeprom_size_combo.setCurrentIndex(i)
+                        break
+            
             msg = (f"Detected EEPROM:\n"
                   f"Type: {eeprom_info['type']}\n"
-                  f"Size: {eeprom_info['size']}\n"
+                  f"Size: {eeprom_info['size']} bytes\n"
                   f"Address: 0x{eeprom_info['address']:02X}")
             QMessageBox.information(self, "EEPROM Detected", msg)
         else:
@@ -317,7 +363,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("EEPROM written successfully", 3000)
             else:
                 QMessageBox.warning(self, "Write Failed", 
-                                  "Failed to write EEPROM.")
+                                  "Failed to write EEP ROM.")
                 self.statusBar().showMessage("EEPROM write failed", 3000)
                 
     @pyqtSlot()
